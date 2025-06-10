@@ -750,7 +750,11 @@ class Miner:
                 debug_dict = {}
 
                 # Add model parameters debug info
-                for name, param in self.model.named_parameters():
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    model_iterator = self.model.module.named_parameters()
+                else:
+                    model_iterator = self.model.named_parameters()
+                for name, param in model_iterator:
                     if (
                         param is not None and param.numel() >= 2
                     ):  # Check if tensor has at least 2 elements
