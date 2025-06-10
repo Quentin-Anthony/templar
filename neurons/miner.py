@@ -504,9 +504,7 @@ class Miner:
                 dist.barrier()
             if self.is_master:
                 compress_start = tplr.T()
-                gradient, xshapes, totalks = tplr.prepare_gradient_dict(
-                    self, pages, step_window
-                )
+                gradient, _, _ = tplr.prepare_gradient_dict(self, pages, step_window)
                 tplr.logger.info(
                     f"{tplr.P(step_window, tplr.T() - compress_start)} Compressed local gradients"
                 )
@@ -596,19 +594,43 @@ class Miner:
 
             gather_start = tplr.T()
             tplr.logger.info("Waiting on gather task...")
-            gather_result = await self.comms.gather(
-                my_uid=self.uid,
-                uids=self.comms.peers,
-                window=step_window,
-                key="gradient",
-                timeout=45,
-                device=self.config.device,
-                local=False,
-                stale_retention=100,
-                totalks=self.totalks,
-                time_min=time_min,
-                time_max=time_max,
-            )
+            if self.world_size > 1:
+                if self.is_master:
+                    gather_result = await self.comms.gather(
+                        my_uid=self.uid,
+                        uids=self.comms.peers,
+                        window=step_window,
+                        key="gradient",
+                        timeout=45,
+                        device=str(self.device),
+                        local=False,
+                        stale_retention=100,
+                        totalks=self.totalks,
+                        time_min=time_min,
+                        time_max=time_max,
+                    )
+                    tplr.logger.info("Gather task completed!")
+                else:
+                    gather_result = None
+
+                # Broadcast gather_result from rank 0 to all other ranks
+                obj_list = [gather_result]  # must be a list
+                dist.broadcast_object_list(obj_list, src=0)
+                gather_result = obj_list[0]
+            else:
+                gather_result = await self.comms.gather(
+                    my_uid=self.uid,
+                    uids=self.comms.peers,
+                    window=step_window,
+                    key="gradient",
+                    timeout=45,
+                    device=str(self.device),
+                    local=False,
+                    stale_retention=100,
+                    totalks=self.totalks,
+                    time_min=time_min,
+                    time_max=time_max,
+                )
             tplr.logger.info("Gather task completed!")
             gather_time = tplr.T() - gather_start
 
