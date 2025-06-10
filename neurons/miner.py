@@ -21,7 +21,6 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
-import math
 import os
 import random
 import sys
@@ -115,6 +114,15 @@ class Miner:
 
         return config
 
+    @staticmethod
+    def should_continue(local_has_batch: bool, device) -> bool:
+        """
+        Synchronize across all ranks. If *any* rank runs out of batches, all must stop.
+        """
+        flag_tensor = torch.tensor([int(local_has_batch)], device=device)
+        dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
+        return bool(flag_tensor.item())
+
     def __init__(self):
         tplr.logger.debug("Starting initialization...")
 
@@ -159,6 +167,7 @@ class Miner:
         # Init model with hparams config
         self.model = LlamaForCausalLM(self.hparams.model_config)
         self.model.to(self.device)
+        self.model.gradient_checkpointing_enable()
         if self.world_size > 1:
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model,
@@ -166,7 +175,6 @@ class Miner:
                 output_device=self.local_rank,
             )
         self.tokenizer = self.hparams.tokenizer
-        self.model.gradient_checkpointing_enable()
 
         # Init compression
         self.transformer = tplr.compress.TransformDCT(
@@ -187,7 +195,7 @@ class Miner:
         for n, p in self.model.named_parameters():
             if self.is_master:
                 self.momentum[n] = torch.zeros_like(p)
-            _, _, xshape, totalk, quant_params = self.compressor.compress(
+            _, _, xshape, totalk, _ = self.compressor.compress(
                 self.transformer.encode(torch.zeros_like(p)),
                 self.hparams.topk_compression,
             )
@@ -351,9 +359,10 @@ class Miner:
                 tplr.logger.info("Checkpoint is up-to-date, skipping catchup.")
         else:
             tplr.logger.info("No checkpoint found, initializing model from scratch")
-            self.momentum = {
-                n: torch.zeros_like(p) for n, p in self.model.named_parameters()
-            }
+            if self.is_master:
+                self.momentum = {
+                    n: torch.zeros_like(p) for n, p in self.model.named_parameters()
+                }
             self.model.to(self.device)
 
             # Catch up with aggregation server from start window.
@@ -420,10 +429,29 @@ class Miner:
             n_batches = 0
             window_tokens = 0  # Initialize token count for this window
 
-            for i, batch in enumerate(loader):
+            loader_iter = iter(loader)
+            while True:
+                try:
+                    batch = next(loader_iter)
+                    local_has_batch = True
+                except StopIteration:
+                    local_has_batch = False
+                    batch = None
+
+                if self.world_size > 1:
+                    cont = self.should_continue(local_has_batch, self.device)
+                    if not cont:
+                        if self.is_master:
+                            tplr.logger.info(
+                                "Stopping batch loop: at least one rank exhausted."
+                            )
+                        break
+                    if not local_has_batch:
+                        continue
+
                 input_ids = torch.tensor(batch, dtype=torch.long).to(self.device)
-                tokens_this_batch = input_ids.numel()  # Tokens in current batch
-                window_tokens += tokens_this_batch  # Accumulate tokens
+                tokens_this_batch = input_ids.numel()
+                window_tokens += tokens_this_batch
                 labels = input_ids.clone()
                 labels = torch.where(
                     labels == self.tokenizer.pad_token_id, -100, labels
@@ -435,7 +463,8 @@ class Miner:
                 total_loss += outputs.loss.item()
                 outputs.loss.backward()
                 n_batches += 1
-                tplr.logger.info(f"loss: {outputs.loss.item()} [Batch {i + 1}]")
+                tplr.logger.info(f"loss: {outputs.loss.item()} [Batch {n_batches}]")
+
                 if self.current_window != step_window:
                     tplr.logger.info("<Exhausted window>")
                     break
@@ -657,8 +686,8 @@ class Miner:
                                 p.to(self.device),
                                 idxs,
                                 vals,
-                                xshapes[n],
-                                totalks[n],
+                                self.xshapes[n],
+                                self.totalks[n],
                                 quant_params,
                             )
                         )
