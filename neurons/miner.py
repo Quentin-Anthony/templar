@@ -618,9 +618,9 @@ class Miner:
                 dist.broadcast_object_list(obj_list, src=0)
                 gather_result = obj_list[0]
                 if gather_result is not None:
-                    for k, v in gather_result.state_dict.items():
+                    for k, v in vars(gather_result.state_dict).items():
                         if isinstance(v, torch.Tensor):
-                            gather_result.state_dict[k] = v.to(self.device)
+                            setattr(gather_result.state_dict, k, v.to(self.device))
             else:
                 gather_result = await self.comms.gather(
                     my_uid=self.uid,
