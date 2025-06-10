@@ -192,7 +192,11 @@ class Miner:
             self.momentum = {}
         self.xshapes = {}
         self.totalks = {}
-        for n, p in self.model.named_parameters():
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            model_iterator = self.model.module.named_parameters()
+        else:
+            model_iterator = self.model.named_parameters()
+        for n, p in model_iterator:
             if self.is_master:
                 self.momentum[n] = torch.zeros_like(p)
             _, _, xshape, totalk, _ = self.compressor.compress(
@@ -360,9 +364,11 @@ class Miner:
         else:
             tplr.logger.info("No checkpoint found, initializing model from scratch")
             if self.is_master:
-                self.momentum = {
-                    n: torch.zeros_like(p) for n, p in self.model.named_parameters()
-                }
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    model_iterator = self.model.module.named_parameters()
+                else:
+                    model_iterator = self.model.named_parameters()
+                self.momentum = {n: torch.zeros_like(p) for n, p in model_iterator}
             self.model.to(self.device)
 
             # Catch up with aggregation server from start window.
@@ -483,9 +489,7 @@ class Miner:
                     "Training complete; waiting for window to be exhausted..."
                 )
                 while self.current_window == step_window:
-                    await asyncio.sleep(
-                        0.1
-                    )  # TODO: Consider adding a timeout safeguard here.
+                    await asyncio.sleep(0.1)
             tplr.logger.info(
                 f"{tplr.P(step_window, tplr.T() - train_start)} Completed training"
             )
@@ -668,7 +672,11 @@ class Miner:
             self.optimizer.zero_grad()
 
             if gather_result is not None and gather_result.state_dict is not None:
-                for n, p in self.model.named_parameters():
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                    model_iterator = self.model.module.named_parameters()
+                else:
+                    model_iterator = self.model.named_parameters()
+                for n, p in model_iterator:
                     idxs_key = n + "idxs"
                     vals_key = n + "vals"
                     quant_key = n + "quant_params"

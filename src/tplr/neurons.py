@@ -75,7 +75,11 @@ def prepare_gradient_dict(miner, pages, step_window):
     # Check if we're in the first 5 iterations
     is_early_iteration = miner.gradient_iteration_counter <= 5
 
-    for n, p in miner.model.named_parameters():
+    if isinstance(miner.model, torch.nn.parallel.DistributedDataParallel):
+        model_iterator = miner.model.module.named_parameters()
+    else:
+        model_iterator = miner.model.named_parameters()
+    for n, p in model_iterator:
         # Apply weight decay
         p.data.mul_(1.0 - lr * miner.hparams.weight_decay)
 
@@ -100,6 +104,8 @@ def prepare_gradient_dict(miner, pages, step_window):
         idxs, vals, xshape, totalk, quant_params = miner.compressor.compress(
             encoded, miner.hparams.topk_compression
         )
+        if totalk is None:
+            print("totalk is None")
         del encoded  # Free the encoded tensor immediately
 
         # Estimate transmitted gradient
