@@ -619,19 +619,21 @@ class Miner:
                 gather_result = obj_list[0]
                 if gather_result is not None:
                     for k, v in vars(gather_result.state_dict).items():
-                        # case 1: plain tensor (idxs / vals)
+                        # ── 1. Plain tensor ───────────────────────────────
                         if isinstance(v, torch.Tensor):
                             setattr(gather_result.state_dict, k, v.to(self.device))
 
-                        # case 2: list returned by compressor (quant_params)
-                        elif isinstance(v, list):
+                        # ── 2. list or tuple (quant_params) ───────────────
+                        elif isinstance(v, (list, tuple)):
                             moved = []
                             for item in v:
                                 if isinstance(item, torch.Tensor):
                                     moved.append(item.to(self.device))
                                 else:
                                     moved.append(item)
-                            setattr(gather_result.state_dict, k, moved)
+                            # preserve original container type
+                            converted = type(v)(moved)
+                            setattr(gather_result.state_dict, k, converted)
             else:
                 gather_result = await self.comms.gather(
                     my_uid=self.uid,
