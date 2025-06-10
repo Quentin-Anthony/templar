@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import math
 import os
 import random
 import sys
@@ -32,6 +33,7 @@ from typing import cast
 import bittensor as bt
 import numpy as np
 import torch
+import torch.distributed as dist
 import uvloop
 
 # Third party
@@ -82,6 +84,9 @@ class Miner:
         parser.add_argument(
             "--device", type=str, default="cuda", help="Device to use for training"
         )
+        parser.add_argument(
+            "--local_rank", type=int, default=int(os.getenv("LOCAL_RANK", 0))
+        )
         parser.add_argument("--debug", action="store_true", help="Enable debug logging")
         parser.add_argument("--trace", action="store_true", help="Enable trace logging")
         parser.add_argument(
@@ -115,6 +120,23 @@ class Miner:
 
         # Init config and load hparams
         self.config = Miner.config()
+        # ---------------------------------------------------------------------
+        # Distributed initialisation
+        # ---------------------------------------------------------------------
+        self.rank = int(os.getenv("RANK", 0))
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
+        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+
+        if self.world_size > 1:
+            dist.init_process_group(backend="nccl", init_method="env://")
+            torch.cuda.set_device(self.local_rank)
+            self.config.device = f"cuda:{self.local_rank}"
+        else:
+            self.config.device = self.config.device or "cuda"
+        self.device = torch.device(self.config.device)
+
+        # Convenience flags
+        self.is_master = self.rank == 0
         self.hparams = tplr.load_hparams(use_local_run_hparams=self.config.local)
 
         if self.config.actual_batch_size is not None:
@@ -136,7 +158,13 @@ class Miner:
 
         # Init model with hparams config
         self.model = LlamaForCausalLM(self.hparams.model_config)
-        self.model.to(self.config.device)  # type: ignore
+        self.model.to(self.device)
+        if self.world_size > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+            )
         self.tokenizer = self.hparams.tokenizer
         self.model.gradient_checkpointing_enable()
 
@@ -152,13 +180,16 @@ class Miner:
 
         # Init optimizer and momentum
         self.optimizer = SGD(self.model.parameters(), lr=self.hparams.learning_rate)
-        self.momentum = {}
+        if self.is_master:
+            self.momentum = {}
         self.xshapes = {}
         self.totalks = {}
         for n, p in self.model.named_parameters():
-            self.momentum[n] = torch.zeros_like(p)
+            if self.is_master:
+                self.momentum[n] = torch.zeros_like(p)
             _, _, xshape, totalk, quant_params = self.compressor.compress(
-                self.transformer.encode(self.momentum[n]), self.hparams.topk_compression
+                self.transformer.encode(torch.zeros_like(p)),
+                self.hparams.topk_compression,
             )
             self.xshapes[n] = xshape
             self.totalks[n] = totalk
@@ -219,24 +250,25 @@ class Miner:
         self.total_tokens_processed = 0
         self.batch_times = []  # For tracking processing speed
 
-        # Initialize WandB
-        self.wandb = tplr.initialize_wandb(
-            run_prefix="M",
-            uid=self.uid,
-            config=self.config,
-            group="miner",
-            job_type="mining",
-        )
+        if self.is_master:
+            # Initialize WandB
+            self.wandb = tplr.initialize_wandb(
+                run_prefix="M",
+                uid=self.uid,
+                config=self.config,
+                group="miner",
+                job_type="mining",
+            )
 
-        # Initialize metrics logger for InfluxDB
-        self.metrics_logger = tplr.metrics.MetricsLogger(
-            prefix="M",
-            uid=self.uid,
-            config=self.config,
-            role="miner",
-            group="miner",
-            job_type="mining",
-        )
+            # Initialize metrics logger for InfluxDB
+            self.metrics_logger = tplr.metrics.MetricsLogger(
+                prefix="M",
+                uid=self.uid,
+                config=self.config,
+                role="miner",
+                group="miner",
+                job_type="mining",
+            )
 
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
@@ -291,7 +323,7 @@ class Miner:
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             current_window=self.current_window,
-            device=cast(str, self.config.device),
+            device=cast(str, self.device),
             init_version=tplr.__version__
             if has_new_checkpoint
             else self.bootstrap_version,
@@ -322,7 +354,7 @@ class Miner:
             self.momentum = {
                 n: torch.zeros_like(p) for n, p in self.model.named_parameters()
             }
-            self.model.to(self.config.device)  # type: ignore
+            self.model.to(self.device)
 
             # Catch up with aggregation server from start window.
             tplr.logger.info(
@@ -349,12 +381,22 @@ class Miner:
                 instance=self, window=step_window, peer_start=peer_start
             )
 
-            # 2. Load training data for this window
+            # 2. Load ONLY the pages that belong to *this* rank -------------------
             data_start = tplr.T()
+            total_pages = self.hparams.pages_per_window
+            start_idx, n_my_pages = self.pages_for_rank(
+                total_pages, self.rank, self.world_size
+            )
+            global_offset = step_window * total_pages + start_idx
+
             pages = await tplr.r2_dataset.R2DatasetLoader.next_pages(
-                offset=step_window * self.hparams.pages_per_window,
-                n_pages=self.hparams.pages_per_window,
-                seed=self.uid,  # type: ignore
+                offset=global_offset,
+                n_pages=n_my_pages,
+                seed=self.uid,
+            )
+            tplr.logger.info(
+                f"[Rank {self.rank}/{self.world_size}] pages "
+                f"{list(range(start_idx, start_idx + n_my_pages))}"
             )
             loader = await tplr.r2_dataset.R2DatasetLoader.create(
                 batch_size=self.hparams.batch_size,
@@ -379,7 +421,7 @@ class Miner:
             window_tokens = 0  # Initialize token count for this window
 
             for i, batch in enumerate(loader):
-                input_ids = torch.tensor(batch, dtype=torch.long).to(self.model.device)
+                input_ids = torch.tensor(batch, dtype=torch.long).to(self.device)
                 tokens_this_batch = input_ids.numel()  # Tokens in current batch
                 window_tokens += tokens_this_batch  # Accumulate tokens
                 labels = input_ids.clone()
@@ -387,7 +429,7 @@ class Miner:
                     labels == self.tokenizer.pad_token_id, -100, labels
                 )
 
-                with autocast(device_type=self.model.device.type, dtype=torch.bfloat16):
+                with autocast(device_type=self.device.type, dtype=torch.bfloat16):
                     outputs = self.model(input_ids=input_ids, labels=labels)
 
                 total_loss += outputs.loss.item()
@@ -419,45 +461,57 @@ class Miner:
                 f"{tplr.P(step_window, tplr.T() - train_start)} Completed training"
             )
 
-            compress_start = tplr.T()
-            gradient, xshapes, totalks = tplr.prepare_gradient_dict(
-                self, pages, step_window
-            )
-            tplr.logger.info(
-                f"{tplr.P(step_window, tplr.T() - compress_start)} Compressed local gradients"
-            )
-            tplr.logger.debug(f"Putting own state dict for UID {self.uid}")
+            if self.world_size > 1 and self.is_master:
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(self.world_size)
 
-            # Move everything to CPU before upload
-            processed_state_dict = {}
-            for k, v in gradient.items():
-                if isinstance(v, torch.Tensor):
-                    processed_state_dict[k] = v.to("cpu")
-                else:
-                    processed_state_dict[k] = v
+            # 2️⃣ Synchronise all ranks so we know everyone is done with backward()
+            if self.world_size > 1:
+                dist.barrier()
+            if self.is_master:
+                compress_start = tplr.T()
+                gradient, xshapes, totalks = tplr.prepare_gradient_dict(
+                    self, pages, step_window
+                )
+                tplr.logger.info(
+                    f"{tplr.P(step_window, tplr.T() - compress_start)} Compressed local gradients"
+                )
+                tplr.logger.debug(f"Putting own state dict for UID {self.uid}")
 
-            # Launch the put operation as a background task
-            put_completion_time = await self.comms.put(
-                state_dict=processed_state_dict,
-                uid=str(self.uid),
-                window=step_window,
-                key="gradient",
-                global_step=self.global_step,
-                local=False,
-                stale_retention=100,
-            )
-            tplr.logger.info("Put task completed!")
+                # Move everything to CPU before upload
+                processed_state_dict = {}
+                for k, v in gradient.items():
+                    if isinstance(v, torch.Tensor):
+                        processed_state_dict[k] = v.to("cpu")
+                    else:
+                        processed_state_dict[k] = v
 
-            upload_size = sum(
-                tensor.element_size() * tensor.nelement()
-                for tensor in processed_state_dict.values()
-                if isinstance(tensor, torch.Tensor)
-            )
-            tplr.logger.info(
-                f"Uploading {upload_size} bytes of own state for UID: {self.uid}"
-            )
+                # Launch the put operation as a background task
+                put_completion_time = await self.comms.put(
+                    state_dict=processed_state_dict,
+                    uid=str(self.uid),
+                    window=step_window,
+                    key="gradient",
+                    global_step=self.global_step,
+                    local=False,
+                    stale_retention=100,
+                )
+                tplr.logger.info("Put task completed!")
+                upload_size = sum(
+                    tensor.element_size() * tensor.nelement()
+                    for tensor in processed_state_dict.values()
+                    if isinstance(tensor, torch.Tensor)
+                )
+                tplr.logger.info(
+                    f"Uploading {upload_size} bytes of own state for UID: {self.uid}"
+                )
+            else:
+                put_completion_time = 0.0
 
             tplr.logger.info(f"Stopped accumulating: {n_batches} batches")
+            if self.world_size > 1:
+                dist.barrier()
 
             sync_block = self.current_window * self.hparams.blocks_per_window
             retries = 0
@@ -537,42 +591,43 @@ class Miner:
                 if p.grad is not None
             ]
             weight_norms = [p.norm().item() for p in self.model.parameters()]
-            momentum_norms = [m.norm().item() for m in self.momentum.values()]
-            self.wandb.log(
-                {
-                    # Training metrics
-                    "miner/loss": total_loss / n_batches if n_batches > 0 else 0,
-                    "miner/tokens_per_sec": tokens_per_sec,
-                    "miner/batch_duration": duration,
-                    "miner/total_tokens": self.total_tokens_processed,
-                    "miner/batch_tokens": window_tokens,
-                    "miner/global_step": self.global_step,
-                    # Resource metrics
-                    "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
-                    / 1024**2,  # MB
-                    "miner/gpu_memory_cached": torch.cuda.memory_reserved()
-                    / 1024**2,  # MB
-                    # Network metrics
-                    "miner/gather_peers": len(self.comms.peers),
-                    "miner/effective_batch_size": len(self.comms.peers)
-                    * self.hparams.batch_size,
-                    # Optimization metrics
-                    "miner/learning_rate": self.scheduler.get_last_lr()[0],
-                    # Gradient statistics as points
-                    "miner/mean_grad_norm": sum(grad_norms) / len(grad_norms)
-                    if grad_norms
-                    else 0,
-                    "miner/max_grad_norm": max(grad_norms) if grad_norms else 0,
-                    "miner/min_grad_norm": min(grad_norms) if grad_norms else 0,
-                    "miner/grad_norm_std": torch.tensor(grad_norms).std().item()
-                    if grad_norms
-                    else 0,
-                    "miner/mean_weight_norm": sum(weight_norms) / len(weight_norms),
-                    "miner/mean_momentum_norm": sum(momentum_norms)
-                    / len(momentum_norms),
-                },
-                step=self.global_step,
-            )
+            if self.is_master:
+                momentum_norms = [m.norm().item() for m in self.momentum.values()]
+                self.wandb.log(
+                    {
+                        # Training metrics
+                        "miner/loss": total_loss / n_batches if n_batches > 0 else 0,
+                        "miner/tokens_per_sec": tokens_per_sec,
+                        "miner/batch_duration": duration,
+                        "miner/total_tokens": self.total_tokens_processed,
+                        "miner/batch_tokens": window_tokens,
+                        "miner/global_step": self.global_step,
+                        # Resource metrics
+                        "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
+                        / 1024**2,  # MB
+                        "miner/gpu_memory_cached": torch.cuda.memory_reserved()
+                        / 1024**2,  # MB
+                        # Network metrics
+                        "miner/gather_peers": len(self.comms.peers),
+                        "miner/effective_batch_size": len(self.comms.peers)
+                        * self.hparams.batch_size,
+                        # Optimization metrics
+                        "miner/learning_rate": self.scheduler.get_last_lr()[0],
+                        # Gradient statistics as points
+                        "miner/mean_grad_norm": sum(grad_norms) / len(grad_norms)
+                        if grad_norms
+                        else 0,
+                        "miner/max_grad_norm": max(grad_norms) if grad_norms else 0,
+                        "miner/min_grad_norm": min(grad_norms) if grad_norms else 0,
+                        "miner/grad_norm_std": torch.tensor(grad_norms).std().item()
+                        if grad_norms
+                        else 0,
+                        "miner/mean_weight_norm": sum(weight_norms) / len(weight_norms),
+                        "miner/mean_momentum_norm": sum(momentum_norms)
+                        / len(momentum_norms),
+                    },
+                    step=self.global_step,
+                )
 
             # ---------------------------------------------------------------------
             # 6. Await both gather
@@ -599,7 +654,7 @@ class Miner:
                             vals = [vals]
                         new_grad = self.transformer.decode(
                             self.compressor.batch_decompress(
-                                p.to(self.config.device),
+                                p.to(self.device),
                                 idxs,
                                 vals,
                                 xshapes[n],
@@ -631,122 +686,131 @@ class Miner:
                     f"{tplr.P(step_window, tplr.T() - window_start)} Completed window iteration"
                 )
 
-            # Add debug data including successfully gathered peers
-            debug_dict = {}
+            if self.is_master:
+                # Add debug data including successfully gathered peers
+                debug_dict = {}
 
-            # Add model parameters debug info
-            for name, param in self.model.named_parameters():
-                if (
-                    param is not None and param.numel() >= 2
-                ):  # Check if tensor has at least 2 elements
-                    debug_dict[name + "_debug"] = (
-                        param.flatten()[10:12].detach().cpu().tolist()
+                # Add model parameters debug info
+                for name, param in self.model.named_parameters():
+                    if (
+                        param is not None and param.numel() >= 2
+                    ):  # Check if tensor has at least 2 elements
+                        debug_dict[name + "_debug"] = (
+                            param.flatten()[10:12].detach().cpu().tolist()
+                        )
+
+                # Add successful peers information
+                if gather_result is not None:
+                    debug_dict["successful_peers"] = sorted(
+                        list(set(self.comms.peers) - set(gather_result.skipped_uids))
+                    )
+                    debug_dict["skipped_peers"] = sorted(
+                        list(gather_result.skipped_uids)
                     )
 
-            # Add successful peers information
-            if gather_result is not None:
-                debug_dict["successful_peers"] = sorted(
-                    list(set(self.comms.peers) - set(gather_result.skipped_uids))
+                # Store the debug dictionary
+                asyncio.create_task(
+                    self.comms.put(
+                        state_dict=debug_dict,
+                        uid=str(self.uid),
+                        window=step_window,
+                        key="debug",
+                        local=False,
+                    )
                 )
-                debug_dict["skipped_peers"] = sorted(list(gather_result.skipped_uids))
-
-            # Store the debug dictionary
-            asyncio.create_task(
-                self.comms.put(
-                    state_dict=debug_dict,
-                    uid=str(self.uid),
-                    window=step_window,
-                    key="debug",
-                    local=False,
+                tplr.logger.info(
+                    f"Stored debug values for window {self.current_window}"
                 )
-            )
-            tplr.logger.info(f"Stored debug values for window {self.current_window}")
             # Log total window time and metrics
             tplr.logger.info(
                 f"{tplr.P(self.current_window, tplr.T() - window_start)} Completed window iteration"
             )
 
-            # Calculate common metrics values
-            loss_value = total_loss / n_batches if n_batches > 0 else 0
-            mean_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
-            grad_norm_std = torch.tensor(grad_norms).std().item() if grad_norms else 0
-            mean_weight_norm = (
-                sum(weight_norms) / len(weight_norms) if weight_norms else 0
-            )
-            mean_momentum_norm = (
-                sum(momentum_norms) / len(momentum_norms) if momentum_norms else 0
-            )
-            window_total_time = tplr.T() - window_start
-            peer_update_time = tplr.T() - peer_start
-            data_loading_time = tplr.T() - data_start
-            training_time = tplr.T() - train_start
-            compression_time = tplr.T() - compress_start
-            model_update_time = tplr.T() - update_start
-            gather_success_rate = (
-                gather_result.success_rate * 100 if gather_result else 0.0
-            )
-
             # Log metrics to WandB
-            self.wandb.log(
-                {
-                    # Add timing metrics
-                    "miner/timing/window_total": window_total_time,
-                    "miner/timing/peer_update": peer_update_time,
-                    "miner/timing/data_loading": data_loading_time,
-                    "miner/timing/training": training_time,
-                    "miner/timing/compression": compression_time,
-                    "miner/timing/gather": gather_time,
-                    "miner/timing/put": put_completion_time,
-                    "miner/timing/model_update": model_update_time,
-                    # Existing metrics
-                    "miner/loss": loss_value,
-                    "miner/tokens_per_sec": tokens_per_sec,
-                    "miner/total_tokens": self.total_tokens_processed,
-                    "miner/batch_tokens": window_tokens,
-                    "miner/global_step": self.global_step,
-                    "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
-                    / 1024**2,
-                    "miner/gpu_memory_cached": torch.cuda.memory_reserved() / 1024**2,
-                    "miner/gather_peers": len(self.comms.peers),
-                    "miner/effective_batch_size": len(self.comms.peers)
-                    * self.hparams.batch_size,
-                    "miner/learning_rate": self.scheduler.get_last_lr()[0],
-                    "miner/mean_grad_norm": mean_grad_norm,
-                    "miner/max_grad_norm": max(grad_norms) if grad_norms else 0,
-                    "miner/min_grad_norm": min(grad_norms) if grad_norms else 0,
-                    "miner/grad_norm_std": grad_norm_std,
-                    "miner/mean_weight_norm": mean_weight_norm,
-                    "miner/mean_momentum_norm": mean_momentum_norm,
-                    # Added gather success rate in %
-                    "miner/gather/success_rate": gather_success_rate,
-                },
-                step=self.global_step,
-            )
+            if self.is_master:
+                # Calculate common metrics values
+                loss_value = total_loss / n_batches if n_batches > 0 else 0
+                mean_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
+                grad_norm_std = (
+                    torch.tensor(grad_norms).std().item() if grad_norms else 0
+                )
+                mean_weight_norm = (
+                    sum(weight_norms) / len(weight_norms) if weight_norms else 0
+                )
+                mean_momentum_norm = (
+                    sum(momentum_norms) / len(momentum_norms) if momentum_norms else 0
+                )
+                window_total_time = tplr.T() - window_start
+                peer_update_time = tplr.T() - peer_start
+                data_loading_time = tplr.T() - data_start
+                training_time = tplr.T() - train_start
+                compression_time = tplr.T() - compress_start
+                model_update_time = tplr.T() - update_start
+                gather_success_rate = (
+                    gather_result.success_rate * 100 if gather_result else 0.0
+                )
 
-            self.metrics_logger.log(
-                measurement="training_step_v2",
-                tags={
-                    "window": self.current_window,
-                    "global_step": self.global_step,
-                },
-                fields={
-                    "loss": loss_value,
-                    "n_gather_peers": int(len(self.comms.peers)),
-                    "gather_success_rate": gather_success_rate,
-                    "gather_peers": json.dumps(self.comms.peers),
-                    "skipped_peers": json.dumps(
-                        gather_result.skipped_uids if gather_result else []
-                    ),
-                    "window_total_time": window_total_time,
-                    "peer_update_time": peer_update_time,
-                    "compression_time": compression_time,
-                    "gather_time": gather_time,
-                    "put_time": put_completion_time,
-                    "model_update_time": model_update_time,
-                    "tokens_per_sec": tokens_per_sec,
-                },
-            )
-            tplr.logger.info("Finished metrics logging call for miner")
+                self.wandb.log(
+                    {
+                        # Add timing metrics
+                        "miner/timing/window_total": window_total_time,
+                        "miner/timing/peer_update": peer_update_time,
+                        "miner/timing/data_loading": data_loading_time,
+                        "miner/timing/training": training_time,
+                        "miner/timing/compression": compression_time,
+                        "miner/timing/gather": gather_time,
+                        "miner/timing/put": put_completion_time,
+                        "miner/timing/model_update": model_update_time,
+                        # Existing metrics
+                        "miner/loss": loss_value,
+                        "miner/tokens_per_sec": tokens_per_sec,
+                        "miner/total_tokens": self.total_tokens_processed,
+                        "miner/batch_tokens": window_tokens,
+                        "miner/global_step": self.global_step,
+                        "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
+                        / 1024**2,
+                        "miner/gpu_memory_cached": torch.cuda.memory_reserved()
+                        / 1024**2,
+                        "miner/gather_peers": len(self.comms.peers),
+                        "miner/effective_batch_size": len(self.comms.peers)
+                        * self.hparams.batch_size,
+                        "miner/learning_rate": self.scheduler.get_last_lr()[0],
+                        "miner/mean_grad_norm": mean_grad_norm,
+                        "miner/max_grad_norm": max(grad_norms) if grad_norms else 0,
+                        "miner/min_grad_norm": min(grad_norms) if grad_norms else 0,
+                        "miner/grad_norm_std": grad_norm_std,
+                        "miner/mean_weight_norm": mean_weight_norm,
+                        "miner/mean_momentum_norm": mean_momentum_norm,
+                        # Added gather success rate in %
+                        "miner/gather/success_rate": gather_success_rate,
+                    },
+                    step=self.global_step,
+                )
+
+                self.metrics_logger.log(
+                    measurement="training_step_v2",
+                    tags={
+                        "window": self.current_window,
+                        "global_step": self.global_step,
+                    },
+                    fields={
+                        "loss": loss_value,
+                        "n_gather_peers": int(len(self.comms.peers)),
+                        "gather_success_rate": gather_success_rate,
+                        "gather_peers": json.dumps(self.comms.peers),
+                        "skipped_peers": json.dumps(
+                            gather_result.skipped_uids if gather_result else []
+                        ),
+                        "window_total_time": window_total_time,
+                        "peer_update_time": peer_update_time,
+                        "compression_time": compression_time,
+                        "gather_time": gather_time,
+                        "put_time": put_completion_time,
+                        "model_update_time": model_update_time,
+                        "tokens_per_sec": tokens_per_sec,
+                    },
+                )
+                tplr.logger.info("Finished metrics logging call for miner")
 
             self.global_step += 1
             self.window_step += 1
@@ -757,36 +821,31 @@ class Miner:
                 tplr.logger.info("Logging performance profiling summary...")
                 tplr.r2_dataset.R2DatasetLoader.log_profiling_summary()
 
-            # Save checkpoint logic
-            if self.global_step % self.hparams.checkpoint_frequency == 0:
-                tplr.logger.info(
-                    f"Creating checkpoint at global_step {self.global_step}"
-                )
-
-                # asyncio checkpoint saving task
-                asyncio.create_task(
-                    self.comms.save_checkpoint(
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        momentum=self.momentum,
-                        global_step=self.global_step,
-                        current_window=self.current_window,
-                        start_window=self.start_window,
-                    )
-                )
-            else:
-                tplr.logger.info("Skipping checkpoint save this round")
-
             await self.cleanup_window()
+            if self.world_size > 1:
+                dist.barrier()
 
             # Delete local variables to clear up memory
-            del loader, pages, gather_result, processed_state_dict, gradient
+            del loader, pages, gather_result
+            if self.is_master:
+                del processed_state_dict, gradient
 
             # 4. Wait for next window
             tplr.logger.info("Wait for next window...")
             while self.current_window == step_window:
                 await asyncio.sleep(0.1)
+
+    def pages_for_rank(
+        self, total_pages: int, rank: int, world: int
+    ) -> tuple[int, int]:
+        """
+        Returns (start_index, n_pages) for the slice assigned to `rank`.
+        First `rem` ranks get one extra page when total_pages % world != 0.
+        """
+        pages_per_rank, rem = divmod(total_pages, world)
+        my_pages = pages_per_rank + (1 if rank < rem else 0)
+        global_start = pages_per_rank * rank + min(rank, rem)
+        return global_start, my_pages
 
     async def cleanup_window(self):
         """Aggressive memory cleanup between windows"""
@@ -800,10 +859,10 @@ class Miner:
 
         # Log memory status
         tplr.logger.info(
-            f"After cleanup - GPU allocated: {torch.cuda.memory_allocated(self.config.device) / 1024**3:.2f} GB"
+            f"After cleanup - GPU allocated: {torch.cuda.memory_allocated(self.device) / 1024**3:.2f} GB"
         )
         tplr.logger.info(
-            f"After cleanup - GPU reserved: {torch.cuda.memory_reserved(self.config.device) / 1024**3:.2f} GB"
+            f"After cleanup - GPU reserved: {torch.cuda.memory_reserved(self.device) / 1024**3:.2f} GB"
         )
 
     # Listens for new blocks and sets self.current_block and self.current_window
