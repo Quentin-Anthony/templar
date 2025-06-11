@@ -282,7 +282,13 @@ async def catchup_with_aggregation_server(
                 weight_decay = instance.hparams.weight_decay
 
                 # Apply the gradients to the model parameters
-                for name, param in instance.model.named_parameters():
+                if isinstance(
+                    instance.model, torch.nn.parallel.DistributedDataParallel
+                ):
+                    model_iterator = instance.model.module.named_parameters()
+                else:
+                    model_iterator = instance.model.named_parameters()
+                for name, param in model_iterator:
                     if name in processed_agg_data["tensors"]:
                         # Apply weight decay to the parameter manually if needed
                         if weight_decay > 0:
@@ -446,7 +452,13 @@ async def compare_model_with_debug_dict(
     max_diff = 0.0
 
     # Compare each parameter with its debug entry
-    for name, param in model.named_parameters():
+    if isinstance(
+        model, torch.nn.parallel.DistributedDataParallel
+    ):
+        model_iterator = model.module.named_parameters()
+    else:
+        model_iterator = model.named_parameters()
+    for name, param in model_iterator:
         debug_key = name + "_debug"
 
         if debug_key in debug_dict and isinstance(debug_dict[debug_key], list):

@@ -325,13 +325,17 @@ class Miner:
             >= self.hparams.checkpoint_frequency + checkpoint_window_buffer
         )
         # Proceed to load checkpoint
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            model = self.model.module
+        else:
+            model = self.model
         (
             success,
             loaded_checkpoint_window,
             loaded_optimizer,
             loaded_scheduler,
         ) = await self.comms.load_checkpoint(
-            model=self.model,
+            model=model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             current_window=self.current_window,
@@ -616,24 +620,27 @@ class Miner:
                 # Broadcast gather_result from rank 0 to all other ranks
                 obj_list = [gather_result]  # must be a list
                 dist.broadcast_object_list(obj_list, src=0)
-                gather_result = obj_list[0]
-                if gather_result is not None:
-                    for k, v in vars(gather_result.state_dict).items():
-                        # ── 1. Plain tensor ───────────────────────────────
-                        if isinstance(v, torch.Tensor):
-                            setattr(gather_result.state_dict, k, v.to(self.device))
 
-                        # ── 2. list or tuple (quant_params) ───────────────
-                        elif isinstance(v, (list, tuple)):
-                            moved = []
-                            for item in v:
-                                if isinstance(item, torch.Tensor):
-                                    moved.append(item.to(self.device))
-                                else:
-                                    moved.append(item)
-                            # preserve original container type
-                            converted = type(v)(moved)
-                            setattr(gather_result.state_dict, k, converted)
+                def _move_to_device(obj, device):
+                    """Recursively move every tensor inside obj to device."""
+                    if isinstance(obj, torch.Tensor):
+                        return obj.to(device)
+
+                    if isinstance(obj, (list, tuple)):
+                        return type(obj)(_move_to_device(x, device) for x in obj)
+
+                    if isinstance(obj, dict):
+                        return {k: _move_to_device(v, device) for k, v in obj.items()}
+
+                    return obj  # int / str / None …
+
+                # ─ after dist.broadcast_object_list() … ───────────────────────────────
+                gather_result = obj_list[0]
+
+                if gather_result is not None:
+                    sd = vars(gather_result.state_dict)
+                    for k, v in sd.items():
+                        sd[k] = _move_to_device(v, self.device)
             else:
                 gather_result = await self.comms.gather(
                     my_uid=self.uid,
