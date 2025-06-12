@@ -324,62 +324,81 @@ class Miner:
             self.global_step
             >= self.hparams.checkpoint_frequency + checkpoint_window_buffer
         )
+        # ------------------------------------------------------------------
         # Proceed to load checkpoint
-        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            model = self.model.module
-        else:
-            model = self.model
-        (
-            success,
-            loaded_checkpoint_window,
-            loaded_optimizer,
-            loaded_scheduler,
-        ) = await self.comms.load_checkpoint(
-            model=model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            current_window=self.current_window,
-            device=cast(str, self.device),
-            init_version=tplr.__version__
-            if has_new_checkpoint
-            else self.bootstrap_version,
-        )
-        if success:
-            self.optimizer = loaded_optimizer
-            self.scheduler = loaded_scheduler
-            tplr.logger.info(
-                f"Loaded checkpoint with global_step={self.global_step}, "
-                f"optimizer_step={self.optimizer.state_dict()['state'].get(0, {}).get('step', 0)}, "
-                f"scheduler_step={self.scheduler.last_epoch}"
-            )
-            # Only catch up if we're behind
-            if (
-                loaded_checkpoint_window < self.current_window
-                and self.global_step > checkpoint_window_buffer
-            ):
-                tplr.logger.info(
-                    f"Checkpoint is behind current window ({loaded_checkpoint_window} < {self.current_window}), starting catchup..."
-                )
-                await tplr.neurons.catchup_with_aggregation_server(
-                    self, max(loaded_checkpoint_window, self.start_window)
-                )
-            else:
-                tplr.logger.info("Checkpoint is up-to-date, skipping catchup.")
-        else:
-            tplr.logger.info("No checkpoint found, initializing model from scratch")
-            if self.is_master:
-                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-                    model_iterator = self.model.module.named_parameters()
-                else:
-                    model_iterator = self.model.named_parameters()
-                self.momentum = {n: torch.zeros_like(p) for n, p in model_iterator}
-            self.model.to(self.device)
+        #   • rank-0 (or single-GPU run) downloads & catches-up
+        #   • remaining ranks receive state via NCCL broadcast
+        # ------------------------------------------------------------------
 
-            # Catch up with aggregation server from start window.
-            tplr.logger.info(
-                f"Starting catchup from start window {self.start_window} to current window {self.current_window})..."
+        bare_model = (
+            self.model.module
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+            else self.model
+        )
+
+        if self.world_size == 1 or self.is_master:
+            ckpt_ok, ckpt_sync_win, self.optimizer, self.scheduler = await self.comms.load_checkpoint(
+                model=bare_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                current_window=self.current_window,
+                device=str(self.device),
+                init_version=tplr.__version__ if has_new_checkpoint else self.bootstrap_version,
             )
-            await tplr.neurons.catchup_with_aggregation_server(self, self.start_window)
+
+            if ckpt_ok:
+                tplr.logger.info(f"Checkpoint loaded (sync_window={ckpt_sync_win})")
+
+                # catch-up only if the checkpoint lags behind
+                if (
+                    ckpt_sync_win < self.current_window
+                    and self.global_step > checkpoint_window_buffer
+                ):
+                    await tplr.neurons.catchup_with_aggregation_server(
+                        self, max(ckpt_sync_win, self.start_window)
+                    )
+
+            else:
+                tplr.logger.info("No checkpoint found – starting from scratch")
+
+                # initialise per-parameter momentum on rank-0
+                if self.is_master:
+                    tgt_iter = (
+                        self.model.module.named_parameters()
+                        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+                        else self.model.named_parameters()
+                    )
+                    self.momentum = {n: torch.zeros_like(p) for n, p in tgt_iter}
+
+                # still perform the full catch-up from the very first window
+                await tplr.neurons.catchup_with_aggregation_server(self, self.start_window)
+
+        # ---- broadcast to other ranks (if any) --------------------------------
+        if self.world_size > 1:
+            bcast_start = tplr.T()
+            dist.barrier()
+
+            # 1) parameters & buffers
+            for tensor in bare_model.state_dict().values():
+                if torch.is_tensor(tensor):
+                    dist.broadcast(tensor.data, src=0)
+
+            # 2) optimizer state  (broadcast as one object ➜ load on every rank)
+            opt_pkt = [self.optimizer.state_dict()]
+            dist.broadcast_object_list(opt_pkt, src=0)
+            self.optimizer.load_state_dict(opt_pkt[0])
+
+            # 3) scheduler state (same idea)
+            sched_pkt = [self.scheduler.state_dict()]
+            dist.broadcast_object_list(sched_pkt, src=0)
+            self.scheduler.load_state_dict(sched_pkt[0])
+
+            dist.barrier()
+            bcast_time = tplr.T() - bcast_start
+            tplr.logger.info(
+                f"{tplr.P(self.current_window, bcast_time)} "
+                f"Broadcast checkpoint to {self.world_size-1} ranks"
+            )
 
         self.comms.start_commitment_fetcher()
 
