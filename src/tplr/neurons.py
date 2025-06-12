@@ -416,7 +416,13 @@ def process_loaded_data(model: torch.nn.Module, compressed_data: dict) -> dict |
         "tensors": {},
     }
 
-    for name, param in model.named_parameters():
+    if isinstance(
+        model, torch.nn.parallel.DistributedDataParallel
+    ):
+        model_iterator = model.module.named_parameters()
+    else:
+        model_iterator = model.named_parameters()
+    for name, param in model_iterator:
         if name in state_dict:
             original_shape = param.shape
             # Use unpack_binary_tensor from the sample, but in our context
